@@ -1,98 +1,180 @@
 from styx_msgs.msg import TrafficLight
-import cv2
+import os
+import warnings
+import tarfile
+import six.moves.urllib as urllib
 import numpy as np
+import tensorflow as tf
+from distutils.version import LooseVersion
+
+from object_detection.utils import label_map_util
+from object_detection.utils import visualization_utils as vis_util
 
 class TLClassifier(object):
+
     def __init__(self):
-        #TODO load classifier
-        pass
 
-    def mask_image(self, image, lower_range, upper_range):
-        # Convert RGB to HSV
-        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        self.traffic_light        = TrafficLight.UNKNOWN
+        self.condition_check      = False
+        self.maybe_download_model = False
+        self.mode                 = "sim"
 
-        # Threshold the HSV image to get only selected range colors
-        mask = cv2.inRange(hsv, lower_range, upper_range)
+        """
+        Pretrained model by TensorFlow
+        """
+        #base path where we will save our models
+        #self.PATH_TO_MODEL = '/home/udacity/Final_project/Traffic_light/traffic_light_model/'
 
-        # # Bitwise-AND mask and original image
-        # res = cv2.bitwise_and(image, image, mask=mask)
+        import inspect
+        from os import path
+        self.PATH_TO_MODEL = path.dirname(inspect.stack()[0][1]) + '/'
 
-        return mask
+        # Specify Model To Download. Obtain the model name from the object detection model zoo.
+        self.MODEL_NAME    = 'ssd_inception_v2_coco_2017_11_17'
+        self.MODEL_FILE    = self.MODEL_NAME + '.tar.gz'
+        self.DOWNLOAD_BASE = 'http://download.tensorflow.org/models/object_detection/'
 
-    def detect_yellow(self, img):
-        lower_yellow = np.array([20, 100, 100])
-        upper_yellow = np.array([30, 255, 255])
-        mask = self.mask_image(img, lower_yellow, upper_yellow)
+        # Load the Labels
+        PATH_TO_LABELS = self.PATH_TO_MODEL+'color_label.pbtx'
+        NUM_CLASSES    = 4
 
-        return mask
+        label_map           = label_map_util.load_labelmap(PATH_TO_LABELS)
+        categories          = label_map_util.convert_label_map_to_categories(label_map,
+                                                                             max_num_classes  = NUM_CLASSES,
+                                                                             use_display_name = True)
+        self.category_index = label_map_util.create_category_index(categories)
 
-    def detect_red(self, img):
-        lower_red_1 = np.array([0, 100, 100])
-        upper_red_1 = np.array([10, 255, 255])
+        ##### Build network
 
-        lower_red_2 = np.array([160, 100, 100])
-        upper_red_2 = np.array([179, 255, 255])
+        # GPU
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
 
-        mask_1 = self.mask_image(img, lower_red_1, upper_red_1)
-        mask_2 = self.mask_image(img, lower_red_2, upper_red_2)
-        mask = cv2.bitwise_or(mask_1, mask_2)
+        # TODO: load classifier
+        # http://insightsbot.com/blog/womeQ/tensorflow-object-detection-tutorial-on-images
+        self.detection_graph = tf.Graph()
 
-        return mask
+        if self.mode == "sim":
+            PATH_TO_CKPT = self.PATH_TO_MODEL + 'frozen_inference_graph_sim.pb'
+        else:
+            PATH_TO_CKPT = self.PATH_TO_MODEL + 'frozen_inference_graph_real.pb'
 
-    def detect_green(self, img):
-        lower_green = np.array([37, 38, 100])
-        upper_green = np.array([85, 255, 255])
-        mask = self.mask_image(img, lower_green, upper_green)
+        with self.detection_graph.as_default():
+            od_graph_def = tf.GraphDef()
 
-        return mask
+            with tf.gfile.GFile(PATH_TO_CKPT, 'rb') as fid:
+                serialized_graph = fid.read()
+                od_graph_def.ParseFromString(serialized_graph)
+                tf.import_graph_def(od_graph_def, name='')
 
-    def get_tl_label(self, red_mask, green_mask, yellow_mask):
-        green_count = np.count_nonzero(green_mask)
-        red_count = np.count_nonzero(red_mask)
-        yellow_count = np.count_nonzero(yellow_mask)
+        self.sess           = tf.Session(graph=self.detection_graph, config=config)
 
-        total = green_count + red_count + yellow_count
+        self.image_tensor   = self.detection_graph.get_tensor_by_name('image_tensor:0')
+        self.boxes          = self.detection_graph.get_tensor_by_name('detection_boxes:0')
+        self.scores         = self.detection_graph.get_tensor_by_name('detection_scores:0')
+        self.classes        = self.detection_graph.get_tensor_by_name('detection_classes:0')
+        self.num_detections = self.detection_graph.get_tensor_by_name('num_detections:0')
 
-        color = [red_count, yellow_count, green_count]
+    def check_condition(self):
 
-        if total < 3:
-            return TrafficLight.UNKNOWN
+        # Check TensorFlow Version
+        assert LooseVersion(tf.__version__) != LooseVersion('1.3'), 'Please use Udacity default TensorFlow version 1.3.  You are using {}'.format(tf.__version__)
+        print('TensorFlow Version: {}'.format(tf.__version__))
 
-        index = color.index(max(color))
+        # Check for a GPU
+        if not tf.test.gpu_device_name():
+            warnings.warn('No GPU found. Please use a GPU to train your neural network.')
+        else:
+            print('Default GPU Device: {}'.format(tf.test.gpu_device_name()))
 
-        # if green_count > red_count:
-        #     return TrafficLight.GREEN
-        #
-        # return TrafficLight.RED
-        return index
+        self.condition_check  = True
 
-    def get_classification(self, image, detections):
-        """Determines the color of the traffic light in the image
+    def maybe_download_pretrained_vgg(self):
+
+        """
+        Download and extract pretrained model if it doesn't exist
+        """
+        DESTINATION_MODEL_TAR_PATH = self.PATH_TO_MODEL + self.MODEL_FILE
+
+        # Check if model downloaded
+        if not os.path.exists (self.PATH_TO_MODEL + self.MODEL_NAME + '/frozen_inference_graph.pb'):
+
+            # Download model
+            print 'Downloading pre-trained model...'
+            opener = urllib.request.URLopener()
+            opener.retrieve(self.DOWNLOAD_BASE + self.MODEL_FILE, DESTINATION_MODEL_TAR_PATH)
+
+            # Extracting model
+            print 'Extracting model...'
+            tar_file = tarfile.open(DESTINATION_MODEL_TAR_PATH)
+
+            for file in tar_file.getmembers():
+                file_name = os.path.basename(file.name)
+                if 'frozen_inference_graph.pb' in file_name:
+                    tar_file.extract(file, self.PATH_TO_MODEL)
+
+        self.maybe_download_model = True
+
+    def get_boxes(self, image):
+
+
+        # add dimension to feed classifier
+        feeded_image = np.expand_dims(image, axis=0)
+
+        with self.detection_graph.as_default():
+            boxes, scores, classes, num = self.sess.run([self.boxes,
+                                                          self.scores,
+                                                          self.classes,
+                                                          self.num_detections],
+                                                          feed_dict={self.image_tensor: feeded_image})
+
+        # remove unnessary dimension
+        boxes   = np.squeeze(boxes)
+        scores  = np.squeeze(scores)
+        classes = np.squeeze(classes).astype(np.int32)
+
+        return boxes, scores, classes, num
+
+    def get_classification(self, image):
+        """
+        Determines the color of the traffic light in the image
         Args:
             image (cv::Mat): image containing the traffic light
-            detections: list containing tl detections
         Returns:
             int: ID of traffic light color (specified in styx_msgs/TrafficLight)
         """
         #TODO implement light color prediction
 
-        tl_labels = [0] * 5
-        index = 4
+        if not self.condition_check: self.check_condition()
 
-        for detection in detections:
-            x1, y1, x2, y2 = detection
-            crop = image[y1:y2, x1:x2]
+        if not self.maybe_download_model: self.maybe_download_pretrained_vgg()
 
-            green_mask = self.detect_green(crop)
-            red_mask = self.detect_red(crop)
-            yellow_mask = self.detect_yellow(crop)
+        boxes, scores, classes, num = self.get_boxes(image)
 
-            tl_label = self.get_tl_label(red_mask, green_mask, yellow_mask)
-            tl_labels[tl_label] += 1
+        predicted_traffic_light = "UNKNOWN"
 
-        if detections:
-            # get max vote
-            index = tl_labels.index(max(tl_labels))
+        highest_score = 0.0
 
-        # return TrafficLight.UNKNOWN
-        return index
+        for i in range(boxes.shape[0]):
+            # choose result with confidence over 60%
+            if scores[i] > 0.6 and highest_score < scores[i]:
+                # update traffic light
+                predicted_traffic_light = self.category_index[classes[i]]['name']
+
+        print predicted_traffic_light
+
+        if predicted_traffic_light == "GREEN":
+            self.traffic_light = TrafficLight.GREEN
+
+        elif predicted_traffic_light == "YELLOW":
+            self.traffic_light = TrafficLight.YELLOW
+
+        elif predicted_traffic_light == "RED":
+            self.traffic_light = TrafficLight.RED
+
+        # Visualization of the results of a detection.
+        vis_util.visualize_boxes_and_labels_on_image_array(image, boxes,
+        classes, scores, self.category_index, use_normalized_coordinates=True,
+        line_thickness=8)
+
+        return self.traffic_light
