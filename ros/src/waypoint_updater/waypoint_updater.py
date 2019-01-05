@@ -77,7 +77,7 @@ class WaypointUpdater(object):
         final_line = self.generate_lane()
         self.final_waypoints_pub.publish(final_line)
         
-    def generate_lane():
+    def generate_lane(self):
         lane = Lane()
         lane.header = self.base_waypoints.header
         closest_idx = self.get_closest_waypoint_idx()
